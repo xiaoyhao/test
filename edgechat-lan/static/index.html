@@ -90,26 +90,13 @@ th,td{text-align:left;padding:8px;border-bottom:1px solid var(--line)}
 </head>
 <body>
 
-<!-- ============ 登录 / 注册 ============ -->
+<!-- ============ 自动登录中 ============ -->
 <div id="authView">
   <div class="authCard">
     <h1>🛰️ EdgeChat-LAN</h1>
-    <div class="sub">局域网部署版聊天系统 · 开放注册</div>
-    <div id="loginForm">
-      <label>用户名</label><input id="liUser" placeholder="admin">
-      <label>密码</label><input id="liPass" type="password" placeholder="••••••">
-      <button class="btn" onclick="doLogin()">登 录</button>
-      <div class="err" id="liErr"></div>
-      <div class="switch">还没有账号？<a onclick="toggleAuth(false)">注册新账号</a></div>
-    </div>
-    <div id="regForm" class="hidden">
-      <label>用户名</label><input id="rgUser">
-      <label>昵称</label><input id="rgDisp">
-      <label>密码（≥6位）</label><input id="rgPass" type="password">
-      <button class="btn" onclick="doRegister()">注 册</button>
-      <div class="err" id="rgErr"></div>
-      <div class="switch">已有账号？<a onclick="toggleAuth(true)">去登录</a></div>
-    </div>
+    <div class="sub">局域网部署版聊天系统 · 免登录</div>
+    <div style="text-align:center;padding:20px 0;color:var(--muted);font-size:14px" id="authMsg">正在识别设备，自动进入聊天…</div>
+    <div class="err" id="authErr" style="text-align:center"></div>
   </div>
 </div>
 
@@ -124,8 +111,6 @@ th,td{text-align:left;padding:8px;border-bottom:1px solid var(--line)}
     <div class="meBar">
       <div class="avatar" id="meAvatar">?</div>
       <div class="meta"><div id="meName" style="font-size:13px"></div><div class="role" id="meRole"></div></div>
-      <button class="iconBtn" title="管理后台" id="adminBtn" onclick="openAdmin()" style="display:none">⚙️</button>
-      <button class="iconBtn" title="退出" onclick="logout()">⏻</button>
     </div>
   </div>
 
@@ -133,7 +118,7 @@ th,td{text-align:left;padding:8px;border-bottom:1px solid var(--line)}
     <div class="chatHeader">
       <div><div class="title" id="roomTitle">选择会话</div><div class="topic" id="roomTopic"></div></div>
       <div class="spacer"></div>
-      <button class="btn sm ghost" id="addRoomBtn" onclick="showNewChannel()" style="display:none">＋新建频道</button>
+      <button class="btn sm ghost" onclick="showNewChannel()">＋新建频道</button>
     </div>
     <div class="pinnedBar hidden" id="pinnedBar"></div>
     <div class="msgList" id="msgList"><div style="color:var(--muted);text-align:center;margin-top:60px">← 选择一个频道，或点击右侧联系人发起私信</div></div>
@@ -155,21 +140,7 @@ th,td{text-align:left;padding:8px;border-bottom:1px solid var(--line)}
   </div>
 </div>
 
-<!-- ============ 管理后台弹窗 ============ -->
-<div class="modalMask hidden" id="adminMask">
-  <div class="modal">
-    <button class="closeX" onclick="document.getElementById('adminMask').classList.add('hidden')">✕</button>
-    <h2>⚙️ 管理后台</h2>
-    <div class="statGrid" id="statGrid"></div>
-    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px">
-      <button class="btn sm ghost" onclick="rotateKey()">轮换加密密钥</button>
-      <button class="btn sm ghost" onclick="showCreateUser()">创建账号</button>
-    </div>
-    <h3 style="font-size:13px;margin:14px 0 6px">用户管理（临时封禁到期自动解除）</h3>
-    <div id="banTable"></div>
-    <p style="font-size:12px;color:var(--muted);margin-top:14px">隐私说明：后台不提供任何消息正文的搜索或查看入口，仅展示聚合统计。</p>
-  </div>
-</div>
+<!-- ============ 管理后台弹窗已移除（无管理员体系） -->
 
 <script>
 // ---------------------------------------------------------------- 基础状态
@@ -185,7 +156,11 @@ async function api(path, opts = {}) {
     opts.body = typeof opts.body === 'string' ? opts.body : JSON.stringify(opts.body);
   }
   const r = await fetch('/api/v1' + path, opts);
-  if (r.status === 401 && ME) { logout(); throw new Error('会话过期'); }
+  if (r.status === 401) { // 会话过期 → 重新自动登录
+    localStorage.removeItem('ec_token'); TOKEN = '';
+    await autoLogin();
+    throw new Error('会话已刷新，请重试');
+  }
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(data.detail || '请求失败');
   return data;
@@ -195,34 +170,67 @@ function esc(s){return (s==null?'':String(s)).replace(/[&<>"']/g,c=>({'&':'&amp;
 function fmtTime(iso){try{return new Date(iso).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'});}catch(e){return'';}}
 function fmtSize(n){return n>1048576?(n/1048576).toFixed(1)+' MB':(n/1024).toFixed(1)+' KB';}
 
-// ---------------------------------------------------------------- 认证
-function toggleAuth(login){$('loginForm').classList.toggle('hidden',!login);$('regForm').classList.toggle('hidden',login);}
-async function doLogin(){
+// ---------------------------------------------------------------- 浏览器指纹 + 免密自动登录
+function canvasFp(){
   try{
-    const d = await api('/auth/login',{method:'POST',body:{username:$('liUser').value,password:$('liPass').value}});
-    TOKEN=d.token; localStorage.setItem('ec_token',TOKEN); enterApp();
-  }catch(e){$('liErr').textContent=e.message;}
+    const c=document.createElement('canvas'); c.width=240; c.height=60;
+    const x=c.getContext('2d');
+    x.textBaseline='top'; x.font='14px "Arial"'; x.fillStyle='#f60'; x.fillRect(0,0,100,20);
+    x.fillStyle='#069'; x.fillText('edgechat-lan-fp',2,2);
+    x.fillStyle='rgba(102,204,0,0.7)'; x.fillText('edgechat-lan-fp',4,8);
+    return c.toDataURL();
+  }catch(e){return '';}
 }
-async function doRegister(){
+async function sha256hex(s){
+  if(window.crypto&&crypto.subtle&&crypto.subtle.digest){
+    try{
+      const buf=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(s));
+      return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('');
+    }catch(e){/* http 环境可能不可用，回落 */}
+  }
+  // 简易回落哈希（FNV-1a 变体，仅用于设备标识，非安全场景）
+  let h1=0x811c9dc5>>>0, h2=0x01000193>>>0;
+  for(let i=0;i<s.length;i++){const c=s.charCodeAt(i);h1=Math.imul(h1^c,0x01000193)>>>0;h2=Math.imul(h2^(c+i),0x85ebca6b)>>>0;}
+  return (h1.toString(16)+h2.toString(16)).padStart(16,'0').repeat(2).slice(0,32);
+}
+async function computeFingerprint(){
+  let saved = localStorage.getItem('ec_fp');
+  if(saved) return saved;
+  const parts=[
+    navigator.userAgent, navigator.language, screen.width+'x'+screen.height+'x'+screen.colorDepth,
+    new Date().getTimezoneOffset(), navigator.hardwareConcurrency||0, navigator.platform||'',
+    (navigator.deviceMemory||0), canvasFp()
+  ].join('||');
+  const fp = await sha256hex(parts);
+  localStorage.setItem('ec_fp', fp);
+  return fp;
+}
+async function autoLogin(){
+  $('authMsg').textContent='正在识别设备，自动进入聊天…';
   try{
-    const d = await api('/auth/register',{method:'POST',body:{username:$('rgUser').value,password:$('rgPass').value,displayName:$('rgDisp').value}});
-    TOKEN=d.token; localStorage.setItem('ec_token',TOKEN); enterApp();
-  }catch(e){$('rgErr').textContent=e.message;}
+    const fp = await computeFingerprint();
+    const r = await fetch('/api/v1/auth/auto-login',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({fingerprint:fp,userAgent:navigator.userAgent})});
+    const d = await r.json();
+    if(!r.ok) throw new Error(d.detail||'自动登录失败');
+    TOKEN=d.token; localStorage.setItem('ec_token',TOKEN);
+    if(d.isNew) toast('已为你创建设备账号：'+d.user.displayName);
+    await enterApp();
+  }catch(e){
+    $('authMsg').textContent='自动登录失败';
+    $('authErr').textContent=e.message+'（可刷新页面重试）';
+  }
 }
-function logout(){localStorage.removeItem('ec_token');location.reload();}
 
 // ---------------------------------------------------------------- 进入应用
 async function enterApp(){
-  let me;
-  try{ me = await api('/me'); }catch(e){ $('authView').classList.remove('hidden'); return; }
+  const me = await api('/me');
   ME = me.user;
   $('authView').classList.add('hidden'); $('appView').classList.remove('hidden');
   $('meName').textContent = ME.displayName;
-  $('meRole').textContent = (me.role==='admin'?'管理员':'成员')+' @'+ME.username;
+  $('meRole').textContent = '@'+ME.username;
   $('meAvatar').textContent = ME.displayName[0]||'?';
   $('meAvatar').style.background = ME.color||'#4f7cff';
-  $('adminBtn').style.display = me.role==='admin'?'block':'none';
-  $('addRoomBtn').style.display = me.role==='admin'?'block':'none';
   connectInbox();
   await Promise.all([loadRooms(), loadUsers()]);
 }
@@ -279,7 +287,9 @@ function handleFrame(f, kind){
   if(f.type==='message_pinned' && kind==='room'){ addPin(f.message); return; }
   if(f.type==='message_unpinned' && kind==='room'){ unpinById(f.messageId); return; }
   if(f.type==='typing' && kind==='room'){ showTyping(f.user); return; }
+  if(f.type==='presence'){ loadUsers(); return; }
   if(f.type==='room_message'){ loadRooms(); loadUsers(); }
+  if(f.type==='room_created'){ toast('新频道已创建：'+(f.room&&f.room.name)); loadRooms(); loadUsers(); }
 }
 
 // ---------------------------------------------------------------- 会话与消息渲染
@@ -320,8 +330,8 @@ function upsertMessage(m, silent){
      <div class="content">${content}</div>${body}<div class="time">${fmtTime(m.createdAt)}</div>
      <div class="actions">
        <button title="回复" onclick="setReply(${m.id},'${safePrev}')">↩</button>
-       ${(ME&&ME.role==='admin')?`<button title="置顶/取消" onclick="pinMsg(${m.id},${!m.pinned})">📌</button>`:''}
-       ${((mine||(ME&&ME.role==='admin'))&&!m.deleted)?`<button title="撤回" onclick="delMsg(${m.id})">🗑</button>`:''}
+       <button title="置顶/取消" onclick="pinMsg(${m.id},${!m.pinned})">📌</button>
+       ${mine&&!m.deleted?`<button title="撤回" onclick="delMsg(${m.id})">🗑</button>`:''}
      </div></div>`;
     list.appendChild(el);
   }
@@ -371,35 +381,8 @@ async function showNewChannel(){
   const topic=prompt('频道简介（可留空）：')||'';
   try{ const d=await api('/rooms',{method:'POST',body:{kind:'channel',name,topic}}); await loadRooms(); selectRoom(d.room);}catch(e){toast(e.message);}
 }
-async function openAdmin(){
-  $('adminMask').classList.remove('hidden');
-  const s=await api('/admin/stats');
-  const fs = Array.isArray(s.files)?Object.fromEntries(s.files):(s.files||{});
-  $('statGrid').innerHTML=`
-   <div class="stat"><b>${s.users}</b><span>注册用户</span></div>
-   <div class="stat"><b>${s.online}</b><span>当前在线</span></div>
-   <div class="stat"><b>${s.rooms}</b><span>会话数</span></div>
-   <div class="stat"><b>${s.messages}</b><span>消息总数</span></div>
-   <div class="stat"><b>${fmtSize(fs.s||0)}</b><span>文件占用</span></div>
-   <div class="stat"><b>v${s.keyVersion}</b><span>加密密钥版本</span></div>`;
-  const us=await api('/users');
-  $('banTable').innerHTML='<table><tr><th>用户</th><th>角色</th><th>状态</th><th>操作</th></tr>'+
-    us.users.map(u=>`<tr><td>${esc(u.displayName)} @${esc(u.username)}</td><td>${u.role==='admin'?'管理员':'成员'}</td><td>${u.online?'🟢 在线':'⚪ 离线'}</td>
-    <td><button class="btn sm ghost" onclick="banUser(${u.id},60)">封1小时</button>
-        <button class="btn sm ghost" onclick="banUser(${u.id},0)">永久封禁</button>
-        <button class="btn sm ghost" onclick="unbanUser(${u.id})">解封</button></td></tr>`).join('')+'</table>';
-}
-async function rotateKey(){ await api('/admin/keys/rotate',{method:'POST'}); toast('已轮换密钥，新消息将使用新版本加密'); openAdmin(); }
-async function showCreateUser(){
-  const username=prompt('新用户名：'); if(!username)return;
-  const password=prompt('初始密码（≥6位）：'); if(!password)return;
-  try{ await api('/admin/users',{method:'POST',body:{username,password}}); toast('账号已创建'); }catch(e){toast(e.message);}
-}
-async function banUser(id,min){ await api(`/admin/users/${id}/ban`,{method:'POST',body:{minutes:min}}); toast(min?('已临时封禁 '+min+' 分钟'):'已永久封禁'); openAdmin(); }
-async function unbanUser(id){ await api(`/admin/users/${id}/unban`,{method:'POST'}); toast('已解封'); openAdmin(); }
-
 // ---------------------------------------------------------------- 启动
-enterApp();
+autoLogin();
 </script>
 </body>
 </html>

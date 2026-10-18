@@ -1,18 +1,17 @@
 """
-EdgeChat-LAN —— 局域网部署版聊天系统
-参考 https://github.com/aozorae/Edgechat 的功能与实时协议风格（WebSocket v1 帧格式），
+EdgeChat-LAN —— 局域网部署版聊天系统（极简版）
+参考 https://github.com/aozorae/Edgechat 的实时协议风格（WebSocket v1 帧格式），
 去除全部 Telegram 联动 / Cloudflare Workers / D1/KV/R2 依赖，改为单机常驻进程 + SQLite。
 
 特性：
-- 开放自助注册（局域网内直接注册，无需邀请码）+ 管理员账号体系（RBAC：admin / member）
+- 免登录：打开页面即自动注册，浏览器指纹标识用户，用户名形如 "Windows Chrome笔记本"
+- 无管理员体系：所有用户权限相同，任何人都可创建频道和发起私聊
 - 频道群聊 + 一对一私信（会话列表、未读数、@提及）
 - WebSocket 实时推送（protocolVersion:1，ready/message/message_deleted/room_message/presence/typing）
-- 一次性 realtime ticket（60 秒有效，对齐上游 WS 鉴权设计，token 不进 URL）
-- 消息服务端加密落盘（AES-256-GCM，密钥版本化，支持一键轮换）
+- 消息服务端加密落盘（AES-256-GCM，密钥版本化）
 - 文件上传下载（本地磁盘存储，替代 R2）
-- 消息撤回 / 置顶 / 回复 / 引用预览
-- 在线状态（presence）、临时封禁（到期自动解除）
-- 管理后台聚合统计（不提供正文搜索，隐私边界对齐上游）
+- 消息撤回 / 回复 / 引用预览 / 置顶（任何成员均可置顶与撤回自己的消息）
+- 在线状态（presence）
 """
 
 from __future__ import annotations
@@ -29,14 +28,12 @@ import sys
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from io import BytesIO
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form, WebSocket, WebSocketDisconnect, Depends
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, FileResponse
 
 # ------------------------------------------------------------------ 配置
 BASE_DIR = Path(__file__).resolve().parent
@@ -49,11 +46,11 @@ DB_PATH = DATA_DIR / "edgechat.db"
 HOST = os.environ.get("EDGECHAT_HOST", "0.0.0.0")
 PORT = int(os.environ.get("EDGECHAT_PORT", "8790"))
 MAX_UPLOAD_MB = int(os.environ.get("EDGECHAT_MAX_UPLOAD_MB", "50"))
-SESSION_TTL_DAYS = 30
+SESSION_TTL_DAYS = 365  # 指纹登录，token 长期有效
 
-app = FastAPI(title="EdgeChat-LAN", version="1.0.0")
+app = FastAPI(title="EdgeChat-LAN", version="2.0.0")
 
-# ------------------------------------------------------------------ 加密（AES-256-GCM via cryptography，缺失时回落纯 Python GHASH-AES-CTR-HMAC 简化实现）
+# ------------------------------------------------------------------ 加密（AES-256-GCM via cryptography，缺失时回落 HMAC-CTR 方案）
 try:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     _HAS_AESGCM = True
@@ -91,7 +88,6 @@ class MessageCipher:
         if _HAS_AESGCM:
             ct = AESGCM(key).encrypt(nonce, raw, None)
             return f"enc:v{self.current_version}:{base64.b64encode(nonce + ct).decode()}"
-        # 回落：HMAC-SHA256 CTR keystream（无 cryptography 依赖时的安全退化方案）
         stream = b""
         counter = 0
         while len(stream) < len(raw):
@@ -123,7 +119,6 @@ class MessageCipher:
         if key is None:
             return "[无法解密的旧版本消息]"
         if not _HAS_AESGCM:
-            # 环境缺少 cryptography，无法解密 AES-GCM 密文（如依赖变更后遗留的数据）
             return "[无法解密：当前运行环境缺少 cryptography 库]"
         try:
             return AESGCM(key).decrypt(data[:12], data[12:], None).decode("utf-8")
@@ -148,12 +143,11 @@ def db() -> sqlite3.Connection:
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  username TEXT UNIQUE NOT NULL,
+  fingerprint TEXT UNIQUE NOT NULL,             -- 浏览器指纹哈希
+  username TEXT UNIQUE NOT NULL,                -- 自动生成：系统+设备
   display_name TEXT NOT NULL,
-  password_hash TEXT NOT NULL,
-  role TEXT NOT NULL DEFAULT 'member',          -- admin | member
+  created_ip TEXT DEFAULT '',
   avatar_color TEXT DEFAULT '',
-  banned_until TEXT DEFAULT '',                 -- ISO8601，空=未封禁；到期自动解除
   created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS sessions(
@@ -182,9 +176,9 @@ CREATE TABLE IF NOT EXISTS room_members(
 CREATE TABLE IF NOT EXISTS messages(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   room_id INTEGER REFERENCES rooms(id),
-  sender_id INTEGER REFERENCES users(id),
-  content_enc TEXT NOT NULL,                    -- 服务端加密正文
-  content_type TEXT DEFAULT 'text',             -- text | file | image | audio
+  sender_id INTEGER NOT NULL DEFAULT 0,         -- 发送者（0=系统消息，不强制外键）
+  content_enc TEXT NOT NULL,
+  content_type TEXT DEFAULT 'text',
   file_id INTEGER,
   reply_to_id INTEGER,
   mention_ids TEXT DEFAULT '',
@@ -211,64 +205,40 @@ CREATE TABLE IF NOT EXISTS tickets(
   expires_at REAL NOT NULL,
   consumed INTEGER DEFAULT 0
 );
-CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
 """
 
 
-_first_run_info = None  # 首次启动时记录管理员初始密码，供启动横幅输出
-
-
 def init_db():
-    global _first_run_info
     with _db_lock, db() as conn:
-        conn.executescript(SCHEMA)
-        # 清理旧版本遗留的 invites 表（已取消邀请制）
+        # 清理旧版本遗留表（邀请制 / 管理员体系已移除）
         conn.execute("DROP TABLE IF EXISTS invites")
-        if not conn.execute("SELECT 1 FROM users LIMIT 1").fetchone():
-            env_pwd = os.environ.get("EDGECHAT_ADMIN_PASSWORD")
-            pwd = env_pwd or secrets.token_urlsafe(9)
-            conn.execute(
-                "INSERT INTO users(username,display_name,password_hash,role,created_at) VALUES(?,?,?,?,?)",
-                ("admin", "管理员", hash_password(pwd), "admin", now_iso()),
-            )
-            _first_run_info = {"password": pwd, "fromEnv": bool(env_pwd)}
-            # 同时落盘一份，防止终端日志滚走找不到密码
-            (DATA_DIR / "admin_initial_password.txt").write_text(
-                f"用户名: admin\n密码: {pwd}\n"
-                + ("(来自环境变量 EDGECHAT_ADMIN_PASSWORD)\n" if env_pwd else "(随机生成，请登录后尽快修改)\n"),
-                encoding="utf-8")
-        # 默认欢迎频道 + 系统机器人消息
+        old_cols = [r["name"] for r in conn.execute("PRAGMA table_info(users)").fetchall()]
+        if old_cols and ("password_hash" in old_cols or "role" in old_cols or "fingerprint" not in old_cols):
+            # 旧库结构不兼容：重建 users 相关数据（局域网演示场景，直接清库重来）
+            conn.executescript("DROP TABLE IF EXISTS users; DROP TABLE IF EXISTS sessions;"
+                               "DROP TABLE IF EXISTS room_members; DROP TABLE IF EXISTS messages;"
+                               "DROP TABLE IF EXISTS files; DROP TABLE IF EXISTS rooms;")
+            old_cols = []
+        conn.executescript(SCHEMA)
         if not conn.execute("SELECT 1 FROM rooms LIMIT 1").fetchone():
             cur = conn.execute(
-                "INSERT INTO rooms(kind,name,topic,created_by,created_at) VALUES('channel','综合','局域网聊天默认频道',1,?)",
+                "INSERT INTO rooms(kind,name,topic,created_at) VALUES('channel','综合','局域网聊天默认频道',?)",
                 (now_iso(),))
-            conn.execute("INSERT INTO room_members(room_id,user_id,joined_at) VALUES(?,1,?)", (cur.lastrowid, now_iso()))
-            hello = cipher.encrypt("欢迎来到 EdgeChat-LAN 🛰️ 这是运行在你自己局域网里的聊天空间。")
+            hello = cipher.encrypt("欢迎来到 EdgeChat-LAN 🛰️ 打开页面即自动登录，所有人都可以创建频道和私聊。")
             conn.execute(
-                "INSERT INTO messages(room_id,sender_id,content_enc,content_type,created_at) VALUES(?,?,?,'text',?)",
-                (cur.lastrowid, 1, hello, now_iso()))
+                "INSERT INTO messages(room_id,sender_id,content_enc,content_type,created_at) VALUES(?,?,?,?,?)",
+                (cur.lastrowid, 0, hello, 'text', now_iso()))
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def hash_password(pw: str) -> str:
-    salt = secrets.token_hex(8)
-    h = hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), 120_000)
-    return f"pbkdf2${salt}${h.hex()}"
+def random_color():
+    return "#%06x" % secrets.randbelow(0xFFFFFF)
 
 
-def verify_password(pw: str, stored: str) -> bool:
-    try:
-        _, salt, hx = stored.split("$")
-        h = hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), 120_000)
-        return hmac.compare_digest(h.hex(), hx)
-    except Exception:
-        return False
-
-
-# ------------------------------------------------------------------ 实时 Hub（对应上游 Durable Objects UserInbox / ChannelRoom）
+# ------------------------------------------------------------------ 实时 Hub
 @dataclass
 class Connection:
     ws: WebSocket
@@ -281,7 +251,7 @@ class Hub:
     def __init__(self):
         self.conns: list[Connection] = []
         self.lock = threading.Lock()
-        self.typing: dict[tuple[int, int], float] = {}  # (room_id,user_id)->deadline
+        self.typing: dict[tuple[int, int], float] = {}
 
     def add(self, c: Connection):
         with self.lock:
@@ -300,13 +270,23 @@ class Hub:
             return [x for x in self.conns if x.scope == "room" and x.room_id == rid]
 
     async def send_users(self, uids, frame: dict):
-        targets = set()
+        targets = {id(x): x for x in []}
         for u in uids:
-            targets.update(self.sockets_for_user(u))
-        await self._send_all(targets, frame)
+            for c in self.sockets_for_user(u):
+                targets[id(c)] = c
+        await self._send_all(list(targets.values()), frame)
 
     async def send_room(self, rid: int, frame: dict):
-        await self._send_all(set(self.sockets_for_room(rid)), frame)
+        # 注意：Connection 是 unhashable 的 dataclass，不能用 set() 去重，按 id 去重
+        seen: dict[int, Connection] = {}
+        for c in self.sockets_for_room(rid):
+            seen[id(c)] = c
+        await self._send_all(list(seen.values()), frame)
+
+    async def broadcast(self, frame: dict):
+        with self.lock:
+            allc = list(self.conns)
+        await self._send_all(allc, frame)
 
     async def _send_all(self, conns, frame: dict):
         payload = json.dumps(frame, ensure_ascii=False, default=str)
@@ -347,26 +327,30 @@ def message_payload(conn: sqlite3.Connection, m: sqlite3.Row) -> dict:
         "replyToMessageId": m["reply_to_id"],
         "mentionUserIds": [int(x) for x in m["mention_ids"].split(",") if x],
         "type": m["content_type"],
-        "sender": public_user(sender) if sender else None,
+        "sender": public_user(sender) if sender else {"kind": "local", "id": 0, "username": "system",
+                                                       "displayName": "系统", "avatarUrl": "", "color": "#888",
+                                                       "source": "edgechat-lan"},
         "content": cipher.decrypt(m["content_enc"]) if not m["deleted_at"] else None,
         "deleted": bool(m["deleted_at"]),
     }
     if m["file_id"]:
         f = conn.execute("SELECT * FROM files WHERE id=?", (m["file_id"],)).fetchone()
         if f:
-            out["file"] = {
-                "id": f["id"], "name": f["fname"], "size": f["size"], "mime": f["mime"],
-                "url": f"/api/v1/files/{f['id']}",
-            }
+            out["file"] = {"id": f["id"], "name": f["fname"], "size": f["size"], "mime": f["mime"],
+                           "url": f"/api/v1/files/{f['id']}"}
     return out
 
 
+def count_unread(conn: sqlite3.Connection, rid: int, uid: int) -> int:
+    lr = conn.execute("SELECT last_read_msg_id x FROM room_members WHERE room_id=? AND user_id=?", (rid, uid)).fetchone()
+    seen = lr["x"] if lr else 0
+    return conn.execute(
+        "SELECT COUNT(*) c FROM messages WHERE room_id=? AND id>? AND sender_id<>? AND deleted_at IS NULL",
+        (rid, seen, uid),
+    ).fetchone()["c"]
+
+
 def room_view(conn: sqlite3.Connection, room: sqlite3.Row, me_id: int) -> dict:
-    unread_row = conn.execute(
-        "SELECT COALESCE(MAX(m.id),0) mx FROM messages m WHERE m.room_id=? AND m.deleted_at IS NULL AND m.sender_id<>? "
-        "AND m.id > COALESCE((SELECT last_read_msg_id FROM room_members WHERE room_id=? AND user_id=?),0)",
-        (room["id"], me_id, room["id"], me_id),
-    ).fetchone()
     last = conn.execute(
         "SELECT * FROM messages WHERE room_id=? AND deleted_at IS NULL ORDER BY id DESC LIMIT 1", (room["id"],)
     ).fetchone()
@@ -390,16 +374,7 @@ def room_view(conn: sqlite3.Connection, room: sqlite3.Row, me_id: int) -> dict:
     }
 
 
-def count_unread(conn: sqlite3.Connection, rid: int, uid: int) -> int:
-    lr = conn.execute("SELECT last_read_msg_id x FROM room_members WHERE room_id=? AND user_id=?", (rid, uid)).fetchone()
-    seen = lr["x"] if lr else 0
-    return conn.execute(
-        "SELECT COUNT(*) c FROM messages WHERE room_id=? AND id>? AND sender_id<>? AND deleted_at IS NULL",
-        (rid, seen, uid),
-    ).fetchone()["c"]
-
-
-# ------------------------------------------------------------------ 鉴权
+# ------------------------------------------------------------------ 鉴权（token 会话）
 def get_user(request: Request) -> sqlite3.Row | None:
     token = ""
     auth = request.headers.get("authorization", "")
@@ -409,42 +384,17 @@ def get_user(request: Request) -> sqlite3.Row | None:
     if not token:
         return None
     with _db_lock, db() as conn:
-        row = conn.execute(
+        return conn.execute(
             "SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id "
             "WHERE s.token=? AND s.expires_at>?", (token, now_iso())
         ).fetchone()
-        if row and is_banned(conn, row["id"]):
-            return None
-        return row
 
 
 def require_user(request: Request) -> sqlite3.Row:
     u = get_user(request)
     if not u:
-        raise HTTPException(401, "未登录或会话已过期")
+        raise HTTPException(401, "会话已过期，请刷新页面")
     return u
-
-
-def require_admin(request: Request) -> sqlite3.Row:
-    u = require_user(request)
-    if u["role"] != "admin":
-        raise HTTPException(403, "需要管理员权限")
-    return u
-
-
-def is_banned(conn: sqlite3.Connection, uid: int) -> bool:
-    row = conn.execute("SELECT banned_until FROM users WHERE id=?", (uid,)).fetchone()
-    if not row or not row["banned_until"]:
-        return False
-    try:
-        until = datetime.fromisoformat(row["banned_until"])
-    except ValueError:
-        return False
-    if until >= datetime.now(timezone.utc):
-        return True
-    # 到期自动解除
-    conn.execute("UPDATE users SET banned_until='' WHERE id=?", (uid,))
-    return False
 
 
 MENTION_RE = re.compile(r"@([A-Za-z0-9_\u4e00-\u9fff.\-]+)")
@@ -461,75 +411,82 @@ def extract_mentions(conn: sqlite3.Connection, text: str, room_id: int) -> list[
     return ids
 
 
-# ------------------------------------------------------------------ API：认证
-@app.post("/api/v1/auth/login")
-async def login(request: Request):
-    body = await request.json()
-    username = (body.get("username") or "").strip()
-    password = body.get("password") or ""
-    with _db_lock, db() as conn:
-        row = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
-        if not row or not verify_password(password, row["password_hash"]):
-            raise HTTPException(401, "用户名或密码错误")
-        if is_banned(conn, row["id"]):
-            raise HTTPException(403, "账号已被封禁")
-        token = secrets.token_urlsafe(32)
-        conn.execute(
-            "INSERT INTO sessions(token,user_id,created_at,expires_at) VALUES(?,?,?,?)",
-            (token, row["id"], now_iso(), (datetime.now(timezone.utc) + timedelta(days=SESSION_TTL_DAYS)).isoformat()),
-        )
-    return {"token": token, "user": public_user(row), "role": row["role"]}
+# ------------------------------------------------------------------ API：指纹自动注册/登录
+OS_MAP = [("windows nt 10", "Windows"), ("windows nt", "Windows"), ("android", "Android"),
+          ("iphone", "iPhone"), ("ipad", "iPad"), ("mac os x", "macOS"), ("cros", "ChromeOS"),
+          ("linux", "Linux")]
+BROWSER_MAP = [("edg/", "Edge"), ("opr/", "Opera"), ("firefox/", "Firefox"), ("chrome/", "Chrome"),
+               ("safari/", "Safari")]
 
 
-@app.post("/api/v1/auth/register")
-async def register(request: Request):
-    """开放注册：局域网内任何用户可直接注册，无需邀请码。"""
+def guess_device(ua: str) -> tuple[str, str]:
+    low = ua.lower()
+    os_name = "未知系统"
+    for key, name in OS_MAP:
+        if key in low:
+            os_name = name
+            break
+    browser = "浏览器"
+    for key, name in BROWSER_MAP:
+        if key in low:
+            browser = name
+            break
+    mobile = any(k in low for k in ("mobile", "android", "iphone"))
+    device = "手机" if mobile else ("平板" if "ipad" in low or "tablet" in low else "电脑")
+    return os_name, f"{browser}{device}"
+
+
+@app.post("/api/v1/auth/auto-login")
+async def auto_login(request: Request):
+    """免密自动注册/登录：以浏览器指纹定位用户，首次访问自动建号。"""
     body = await request.json()
-    username = (body.get("username") or "").strip()
-    password = body.get("password") or ""
-    display = (body.get("displayName") or username).strip()
-    if not re.fullmatch(r"[A-Za-z0-9_.\u4e00-\u9fff\-]{2,32}", username):
-        raise HTTPException(400, "用户名需为 2-32 位字母数字或中文")
-    if len(password) < 6:
-        raise HTTPException(400, "密码至少 6 位")
+    fp = (body.get("fingerprint") or "").strip()
+    ua = body.get("userAgent") or request.headers.get("user-agent", "")
+    if not re.fullmatch(r"[A-Za-z0-9_\-]{8,64}", fp):
+        raise HTTPException(400, "缺少有效的浏览器指纹")
+    os_name, device_desc = guess_device(ua)
+    ip = request.client.host if request.client else ""
     with _db_lock, db() as conn:
-        if conn.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone():
-            raise HTTPException(400, "用户名已存在")
-        cur = conn.execute(
-            "INSERT INTO users(username,display_name,password_hash,created_at,avatar_color) VALUES(?,?,?,?,?)",
-            (username, display, hash_password(password), now_iso(), random_color()),
-        )
-        uid = cur.lastrowid
-        welcome = conn.execute("SELECT id FROM rooms WHERE kind='channel' AND name='综合'").fetchone()
-        if welcome:
-            conn.execute("INSERT OR IGNORE INTO room_members(room_id,user_id,joined_at) VALUES(?,?,?)",
-                         (welcome["id"], uid, now_iso()))
+        row = conn.execute("SELECT * FROM users WHERE fingerprint=?", (fp,)).fetchone()
+        is_new = row is None
+        if is_new:
+            base = f"{os_name}{device_desc}"
+            username, n = base, 1
+            while conn.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone():
+                n += 1
+                username = f"{base}-{n}"
+            cur = conn.execute(
+                "INSERT INTO users(fingerprint,username,display_name,created_ip,avatar_color,created_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (fp, username, username, ip, random_color(), now_iso()))
+            uid = cur.lastrowid
+            row = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+            # 新成员自动加入所有频道
+            for w in conn.execute("SELECT id FROM rooms WHERE kind='channel'").fetchall():
+                conn.execute("INSERT OR IGNORE INTO room_members(room_id,user_id,joined_at) VALUES(?,?,?)",
+                             (w["id"], uid, now_iso()))
         token = secrets.token_urlsafe(32)
         conn.execute("INSERT INTO sessions(token,user_id,created_at,expires_at) VALUES(?,?,?,?)",
-                     (token, uid, now_iso(), (datetime.now(timezone.utc) + timedelta(days=SESSION_TTL_DAYS)).isoformat()))
-    return {"token": token, "user": {"id": uid, "username": username, "displayName": display}}
+                     (token, row["id"], now_iso(),
+                      (datetime.now(timezone.utc) + timedelta(days=SESSION_TTL_DAYS)).isoformat()))
+    return {"token": token, "user": public_user(row), "isNew": is_new}
 
 
-def random_color():
-    return "#%06x" % secrets.randbelow(0xFFFFFF)
+@app.get("/api/v1/me")
+async def me(request: Request):
+    u = require_user(request)
+    return {"user": public_user(u)}
 
 
 @app.post("/api/v1/auth/logout")
 async def logout(request: Request):
-    u = require_user(request)
     auth = request.headers.get("authorization", "")
     with _db_lock, db() as conn:
         conn.execute("DELETE FROM sessions WHERE token=?", (auth[7:],))
     return {"ok": True}
 
 
-@app.get("/api/v1/me")
-async def me(request: Request):
-    u = require_user(request)
-    return {"user": public_user(u), "role": u["role"]}
-
-
-# ------------------------------------------------------------------ API：realtime ticket（对齐上游一次性票据设计）
+# ------------------------------------------------------------------ API：realtime ticket
 @app.post("/api/v1/realtime/tickets")
 async def create_ticket(request: Request):
     u = require_user(request)
@@ -547,7 +504,7 @@ async def create_ticket(request: Request):
     return {"ticket": ticket, "wsPath": "/api/v1/realtime/ws"}
 
 
-# ------------------------------------------------------------------ API：会话
+# ------------------------------------------------------------------ API：会话（所有人可建频道/私聊）
 @app.post("/api/v1/rooms")
 async def create_room(request: Request):
     u = require_user(request)
@@ -559,8 +516,6 @@ async def create_room(request: Request):
     name = (body.get("name") or "").strip()
     with _db_lock, db() as conn:
         if kind == "channel":
-            if u["role"] != "admin":
-                raise HTTPException(403, "仅管理员可创建频道")
             if not name:
                 raise HTTPException(400, "频道名不能为空")
             cur = conn.execute(
@@ -572,10 +527,13 @@ async def create_room(request: Request):
                              (rid, uid, now_iso()))
         elif kind == "private":
             peer_id = int(body.get("userId", 0))
+            if peer_id == u["id"]:
+                raise HTTPException(400, "不能和自己私聊")
             pair = "|".join(str(x) for x in sorted({u["id"], peer_id}))
             existing = conn.execute("SELECT id FROM rooms WHERE private_pair_key=?", (pair,)).fetchone()
             if existing:
-                return {"room": room_view(conn, conn.execute("SELECT * FROM rooms WHERE id=?", (existing["id"],)).fetchone(), u["id"])}
+                room = conn.execute("SELECT * FROM rooms WHERE id=?", (existing["id"],)).fetchone()
+                return {"room": room_view(conn, room, u["id"])}
             cur = conn.execute(
                 "INSERT INTO rooms(kind,private_pair_key,created_by,created_at) VALUES('private',?,?,?)",
                 (pair, u["id"], now_iso()))
@@ -586,7 +544,21 @@ async def create_room(request: Request):
         else:
             raise HTTPException(400, "未知会话类型")
         room = conn.execute("SELECT * FROM rooms WHERE id=?", (rid,)).fetchone()
-        return {"room": room_view(conn, room, u["id"])}
+        result = {"room": room_view(conn, room, u["id"])}
+    await hub.broadcast({"protocolVersion": 1, "type": "room_created",
+                         "room": {"id": room["id"], "kind": room["kind"], "name": room["name"]}})
+    return result
+
+
+@app.get("/api/v1/rooms")
+async def list_rooms(request: Request):
+    u = require_user(request)
+    with _db_lock, db() as conn:
+        rows = conn.execute(
+            "SELECT r.* FROM rooms r JOIN room_members rm ON rm.room_id=r.id "
+            "WHERE rm.user_id=? AND r.archived=0 ORDER BY r.kind, r.id", (u["id"],)
+        ).fetchall()
+        return {"rooms": [room_view(conn, r, u["id"]) for r in rows]}
 
 
 @app.get("/api/v1/rooms/{rid}/messages")
@@ -611,24 +583,12 @@ async def mark_read(request: Request, rid: int):
     u = require_user(request)
     body = await request.json()
     with _db_lock, db() as conn:
-        conn.execute(
-            "UPDATE room_members SET last_read_msg_id=? WHERE room_id=? AND user_id=?",
-            (int(body.get("lastMessageId", 0)), rid, u["id"]))
+        conn.execute("UPDATE room_members SET last_read_msg_id=? WHERE room_id=? AND user_id=?",
+                     (int(body.get("lastMessageId", 0)), rid, u["id"]))
     return {"ok": True}
 
 
-@app.get("/api/v1/rooms")
-async def list_rooms(request: Request):
-    u = require_user(request)
-    with _db_lock, db() as conn:
-        rows = conn.execute(
-            "SELECT r.* FROM rooms r JOIN room_members rm ON rm.room_id=r.id "
-            "WHERE rm.user_id=? AND r.archived=0 ORDER BY r.kind, r.id", (u["id"],)
-        ).fetchall()
-        return {"rooms": [room_view(conn, r, u["id"]) for r in rows]}
-
-
-# ------------------------------------------------------------------ API：发送消息（幂等 clientMessageId，对齐上游）
+# ------------------------------------------------------------------ API：发送消息
 @app.post("/api/v1/rooms/{rid}/messages")
 async def send_message(request: Request, rid: int):
     u = require_user(request)
@@ -657,23 +617,20 @@ async def send_message(request: Request, rid: int):
         m = conn.execute("SELECT * FROM messages WHERE id=?", (cur.lastrowid,)).fetchone()
         payload = message_payload(conn, m)
         room = conn.execute("SELECT * FROM rooms WHERE id=?", (rid,)).fetchone()
-
-    # 实时分发：房间套接字收 message，成员 inbox 收 room_message 信号
+        member_ids = [x["user_id"] for x in conn.execute("SELECT user_id FROM room_members WHERE room_id=?", (rid,)).fetchall()]
+        signals = []
+        for uid in member_ids:
+            if uid == u["id"]:
+                continue
+            unread = count_unread(conn, rid, uid)
+            signals.append((uid, {
+                "protocolVersion": 1, "type": "room_message",
+                "room": {"id": room["id"], "kind": room["kind"], "name": room["name"]},
+                "messageId": m["id"], "createdAt": m["created_at"], "unreadCount": unread,
+                "mentionsMe": uid in mentions, "contentPreview": (text[:40] if text else "[文件]"),
+                "sender": payload["sender"],
+            }))
     await hub.send_room(rid, {"protocolVersion": 1, "type": "message", "message": payload})
-    member_ids = [x["user_id"] for x in conn.execute("SELECT user_id FROM room_members WHERE room_id=?", (rid,)).fetchall()]
-    signals = []
-    for uid in member_ids:
-        if uid == u["id"]:
-            continue
-        with _db_lock, db() as c2:
-            unread = count_unread(c2, rid, uid)
-        signals.append((uid, {
-            "protocolVersion": 1, "type": "room_message",
-            "room": {"id": room["id"], "kind": room["kind"], "name": room["name"]},
-            "messageId": m["id"], "createdAt": m["created_at"], "unreadCount": unread,
-            "mentionsMe": uid in mentions, "contentPreview": (text[:40] if text else "[文件]"),
-            "sender": payload["sender"],
-        }))
     grouped: dict[int, list] = {}
     for uid, fr in signals:
         grouped.setdefault(uid, []).append(fr)
@@ -689,7 +646,7 @@ async def delete_message(request: Request, mid: int):
         m = conn.execute("SELECT * FROM messages WHERE id=?", (mid,)).fetchone()
         if not m:
             raise HTTPException(404, "消息不存在")
-        if m["sender_id"] != u["id"] and u["role"] != "admin":
+        if m["sender_id"] != u["id"]:
             raise HTTPException(403, "只能撤回自己的消息")
         if m["deleted_at"]:
             return {"ok": True}
@@ -707,8 +664,9 @@ async def pin_message(request: Request, mid: int):
         m = conn.execute("SELECT * FROM messages WHERE id=?", (mid,)).fetchone()
         if not m:
             raise HTTPException(404, "消息不存在")
-        if u["role"] != "admin":
-            raise HTTPException(403, "仅管理员可置顶")
+        if not conn.execute("SELECT 1 FROM room_members WHERE room_id=? AND user_id=?",
+                            (m["room_id"], u["id"])).fetchone():
+            raise HTTPException(403, "仅会话成员可置顶")
         conn.execute("UPDATE messages SET pinned=? WHERE id=?", (1 if body.get("pinned", True) else 0, mid))
         fresh = conn.execute("SELECT * FROM messages WHERE id=?", (mid,)).fetchone()
         payload = message_payload(conn, fresh)
@@ -718,7 +676,7 @@ async def pin_message(request: Request, mid: int):
     return {"ok": True}
 
 
-# ------------------------------------------------------------------ API：文件上传（本地磁盘，替代 R2）
+# ------------------------------------------------------------------ API：文件上传
 @app.post("/api/v1/uploads")
 async def upload(request: Request, file: UploadFile = File(...)):
     u = require_user(request)
@@ -726,8 +684,7 @@ async def upload(request: Request, file: UploadFile = File(...)):
     if len(data) > MAX_UPLOAD_MB * 1024 * 1024:
         raise HTTPException(413, f"文件超过 {MAX_UPLOAD_MB}MB 限制")
     fid = uuid.uuid4().hex
-    stored = UPLOAD_DIR / fid
-    stored.write_bytes(data)
+    (UPLOAD_DIR / fid).write_bytes(data)
     mime = file.content_type or "application/octet-stream"
     ctype = "image" if mime.startswith("image/") else ("audio" if mime.startswith("audio/") else "file")
     with _db_lock, db() as conn:
@@ -748,78 +705,14 @@ async def download(fid: int):
     return FileResponse(UPLOAD_DIR / f["stored_name"], media_type=f["mime"], filename=f["fname"])
 
 
-# ------------------------------------------------------------------ API：用户目录 & 私聊入口
+# ------------------------------------------------------------------ API：用户目录
 @app.get("/api/v1/users")
 async def list_users(request: Request):
     require_user(request)
     with _db_lock, db() as conn:
         rows = conn.execute("SELECT * FROM users ORDER BY id").fetchall()
         online = hub.online_user_ids()
-        return {"users": [{**public_user(r), "online": r["id"] in online, "role": r["role"]} for r in rows]}
-
-
-# ------------------------------------------------------------------ API：管理后台（无正文查看/搜索，聚合统计 only）
-@app.get("/api/v1/admin/stats")
-async def admin_stats(request: Request):
-    require_admin(request)
-    with _db_lock, db() as conn:
-        return {
-            "users": conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"],
-            "online": len(hub.online_user_ids()),
-            "rooms": conn.execute("SELECT COUNT(*) c FROM rooms").fetchone()["c"],
-            "messages": conn.execute("SELECT COUNT(*) c FROM messages").fetchone()["c"],
-            "files": conn.execute("SELECT COUNT(*) c, COALESCE(SUM(size),0) s FROM files").fetchone().items(),
-            "keyVersion": cipher.current_version,
-        }
-
-
-@app.post("/api/v1/admin/users/{uid}/ban")
-async def ban_user(request: Request, uid: int):
-    admin = require_admin(request)
-    body = await request.json()
-    minutes = int(body.get("minutes", 0))  # 0 = 永久
-    with _db_lock, db() as conn:
-        if uid == admin["id"]:
-            raise HTTPException(400, "不能封禁自己")
-        until = "" if minutes == 0 else (datetime.now(timezone.utc) + timedelta(minutes=minutes)).isoformat()
-        conn.execute("UPDATE users SET banned_until=? WHERE id=?", (until, uid))
-        if minutes == 0:
-            conn.execute("DELETE FROM sessions WHERE user_id=?", (uid,))
-    return {"ok": True, "bannedUntil": until}
-
-
-@app.post("/api/v1/admin/users/{uid}/unban")
-async def unban_user(request: Request, uid: int):
-    require_admin(request)
-    with _db_lock, db() as conn:
-        conn.execute("UPDATE users SET banned_until='' WHERE id=?", (uid,))
-    return {"ok": True}
-
-
-@app.post("/api/v1/admin/keys/rotate")
-async def rotate_key(request: Request):
-    require_admin(request)
-    cipher.rotate()
-    return {"keyVersion": cipher.current_version}
-
-
-@app.post("/api/v1/admin/users")
-async def admin_create_user(request: Request):
-    """管理员直接创建账号。"""
-    require_admin(request)
-    body = await request.json()
-    username = (body.get("username") or "").strip()
-    password = body.get("password") or ""
-    if len(password) < 6:
-        raise HTTPException(400, "密码至少 6 位")
-    with _db_lock, db() as conn:
-        if conn.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone():
-            raise HTTPException(400, "用户名已存在")
-        cur = conn.execute(
-            "INSERT INTO users(username,display_name,password_hash,role,created_at,avatar_color) VALUES(?,?,?,?,?,?)",
-            (username, body.get("displayName", username), hash_password(password),
-             body.get("role", "member"), now_iso(), random_color()))
-    return {"id": cur.lastrowid}
+        return {"users": [{**public_user(r), "online": r["id"] in online} for r in rows]}
 
 
 # ------------------------------------------------------------------ WebSocket 实时通道
@@ -837,7 +730,7 @@ async def realtime(ws: WebSocket):
     await ws.accept()
     c = Connection(ws=ws, user_id=t["user_id"], scope=t["scope"], room_id=t["room_id"] or 0)
     hub.add(c)
-    online = hub.online_user_ids()
+    await hub.broadcast({"protocolVersion": 1, "type": "presence", "onlineUserIds": sorted(hub.online_user_ids())})
     try:
         if c.scope == "room":
             with _db_lock, db() as conn:
@@ -845,15 +738,16 @@ async def realtime(ws: WebSocket):
                 pins = conn.execute(
                     "SELECT * FROM messages WHERE room_id=? AND pinned=1 AND deleted_at IS NULL ORDER BY id DESC LIMIT 5",
                     (c.room_id,)).fetchall()
-            await ws.send_text(json.dumps({
-                "protocolVersion": 1, "type": "ready",
-                "room": {"id": room["id"], "kind": room["kind"], "name": room["name"]},
-                "pinned": [message_payload(conn, p) for p in pins],
-                "onlineUserIds": sorted(online),
-            }, ensure_ascii=False, default=str))
+                ready = {
+                    "protocolVersion": 1, "type": "ready",
+                    "room": {"id": room["id"], "kind": room["kind"], "name": room["name"]} if room else None,
+                    "pinned": [message_payload(conn, p) for p in pins],
+                    "onlineUserIds": sorted(hub.online_user_ids()),
+                }
+            await ws.send_text(json.dumps(ready, ensure_ascii=False, default=str))
         else:
             await ws.send_text(json.dumps({"protocolVersion": 1, "type": "ready",
-                                           "onlineUserIds": sorted(online)}, ensure_ascii=False))
+                                           "onlineUserIds": sorted(hub.online_user_ids())}, ensure_ascii=False))
         while True:
             raw = await ws.receive_text()
             try:
@@ -867,8 +761,9 @@ async def realtime(ws: WebSocket):
                 hub.typing[(c.room_id, c.user_id)] = time.time() + 4
                 with _db_lock, db() as conn:
                     who = conn.execute("SELECT * FROM users WHERE id=?", (c.user_id,)).fetchone()
-                await hub.send_room(c.room_id, {"protocolVersion": 1, "type": "typing",
-                                                "roomId": c.room_id, "user": public_user(who)})
+                if who:
+                    await hub.send_room(c.room_id, {"protocolVersion": 1, "type": "typing",
+                                                    "roomId": c.room_id, "user": public_user(who)})
             elif typ == "sync":
                 await ws.send_text(json.dumps({"protocolVersion": 1, "type": "presence",
                                                "onlineUserIds": sorted(hub.online_user_ids())}))
@@ -879,6 +774,7 @@ async def realtime(ws: WebSocket):
         with _db_lock, db() as conn:
             conn.execute("DELETE FROM tickets WHERE user_id=? AND consumed=1 AND expires_at<?",
                          (c.user_id, time.time() - 3600))
+        await hub.broadcast({"protocolVersion": 1, "type": "presence", "onlineUserIds": sorted(hub.online_user_ids())})
 
 
 # ------------------------------------------------------------------ 前端页面
@@ -887,24 +783,12 @@ async def index():
     return (BASE_DIR / "static" / "index.html").read_text(encoding="utf-8")
 
 
-def _startup_banner():
-    """启动横幅：在 uvicorn 日志系统初始化之前输出，确保首次启动的管理员密码一定可见。"""
+if __name__ == "__main__":
+    init_db()
     sys.stdout.write("=" * 60 + "\n")
     sys.stdout.write("EdgeChat-LAN 启动: http://%s:%s  (局域网内其他设备用本机 IP 访问)\n" % (HOST, PORT))
-    if _first_run_info:
-        pwd = _first_run_info["password"]
-        sys.stdout.write("首次启动：已创建管理员账号 admin\n")
-        if _first_run_info["fromEnv"]:
-            sys.stdout.write("初始密码来自环境变量 EDGECHAT_ADMIN_PASSWORD\n")
-        else:
-            sys.stdout.write(f"随机初始密码: {pwd}\n")
+    sys.stdout.write("免登录模式：打开页面即自动注册，无需账号密码\n")
     sys.stdout.write("=" * 60 + "\n")
     sys.stdout.flush()
-
-
-init_db()
-
-if __name__ == "__main__":
     import uvicorn
-    _startup_banner()
     uvicorn.run(app, host=HOST, port=PORT)
