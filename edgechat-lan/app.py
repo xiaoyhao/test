@@ -439,6 +439,7 @@ async def auto_login(request: Request):
     """免密自动注册/登录：以浏览器指纹定位用户，首次访问自动建号。"""
     body = await request.json()
     fp = (body.get("fingerprint") or "").strip()
+    canvas_fp = (body.get("canvasFp") or "").strip()
     ua = body.get("userAgent") or request.headers.get("user-agent", "")
     if not re.fullmatch(r"[A-Za-z0-9_\-]{8,64}", fp):
         raise HTTPException(400, "缺少有效的浏览器指纹")
@@ -449,10 +450,12 @@ async def auto_login(request: Request):
         is_new = row is None
         if is_new:
             display_name = f"{os_name} {browser}"
+            # username 使用画布指纹哈希（canvas.toDataURL() -> hash），缺失时回落设备指纹哈希
+            username = canvas_fp if re.fullmatch(r"[A-Za-z0-9_\-]{8,64}", canvas_fp) else fp
             cur = conn.execute(
                 "INSERT INTO users(fingerprint,username,display_name,created_ip,avatar_color,created_at) "
                 "VALUES(?,?,?,?,?,?)",
-                (fp, fp, display_name, ip, random_color(), now_iso()))
+                (fp, username, display_name, ip, random_color(), now_iso()))
             uid = cur.lastrowid
             row = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
             # 新成员自动加入所有频道

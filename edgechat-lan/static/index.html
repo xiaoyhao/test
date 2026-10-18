@@ -178,14 +178,21 @@ function fmtTime(iso){try{return new Date(iso).toLocaleTimeString('zh-CN',{hour:
 function fmtSize(n){return n>1048576?(n/1048576).toFixed(1)+' MB':(n/1024).toFixed(1)+' KB';}
 
 // ---------------------------------------------------------------- 浏览器指纹 + 免密自动登录
-function canvasFp(){
+let canvasFp = '';   // 画布指纹哈希（在 autoLogin 中计算，用于生成用户名）
+function drawCanvasFp(){
   try{
-    const c=document.createElement('canvas'); c.width=240; c.height=60;
-    const x=c.getContext('2d');
-    x.textBaseline='top'; x.font='14px "Arial"'; x.fillStyle='#f60'; x.fillRect(0,0,100,20);
-    x.fillStyle='#069'; x.fillText('edgechat-lan-fp',2,2);
-    x.fillStyle='rgba(102,204,0,0.7)'; x.fillText('edgechat-lan-fp',4,8);
-    return c.toDataURL();
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+    ctx.textBaseline = 'top';
+    ctx.font = "14px 'Arial'";
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillStyle = '#f60';
+    ctx.fillRect(125, 1, 62, 20);
+    ctx.fillStyle = '#069';
+    ctx.fillText('Fingerprint👆', 2, 15);
+    ctx.fillStyle = 'rgba(102, 204, 0, 0.7)';
+    ctx.fillText('Fingerprint👆', 4, 17);
+    return canvas.toDataURL();
   }catch(e){return '';}
 }
 async function sha256hex(s){
@@ -201,12 +208,14 @@ async function sha256hex(s){
   return (h1.toString(16)+h2.toString(16)).padStart(16,'0').repeat(2).slice(0,32);
 }
 async function computeFingerprint(){
+  // 画布指纹哈希：canvas.toDataURL() -> hash，作为 username 依据
+  canvasFp = await sha256hex(drawCanvasFp());
   let saved = localStorage.getItem('ec_fp');
   if(saved) return saved;
   const parts=[
     navigator.userAgent, navigator.language, screen.width+'x'+screen.height+'x'+screen.colorDepth,
     new Date().getTimezoneOffset(), navigator.hardwareConcurrency||0, navigator.platform||'',
-    (navigator.deviceMemory||0), canvasFp()
+    (navigator.deviceMemory||0), canvasFp
   ].join('||');
   const fp = await sha256hex(parts);
   localStorage.setItem('ec_fp', fp);
@@ -217,7 +226,7 @@ async function autoLogin(){
   try{
     const fp = await computeFingerprint();
     const r = await fetch('/api/v1/auth/auto-login',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({fingerprint:fp,userAgent:navigator.userAgent})});
+      body:JSON.stringify({fingerprint:fp,canvasFp:canvasFp,userAgent:navigator.userAgent})});
     const d = await r.json();
     if(!r.ok) throw new Error(d.detail||'自动登录失败');
     TOKEN=d.token; localStorage.setItem('ec_token',TOKEN);
