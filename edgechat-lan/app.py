@@ -426,14 +426,12 @@ def guess_device(ua: str) -> tuple[str, str]:
         if key in low:
             os_name = name
             break
-    browser = "浏览器"
+    browser = "未知浏览器"
     for key, name in BROWSER_MAP:
         if key in low:
             browser = name
             break
-    mobile = any(k in low for k in ("mobile", "android", "iphone"))
-    device = "手机" if mobile else ("平板" if "ipad" in low or "tablet" in low else "电脑")
-    return os_name, f"{browser}{device}"
+    return os_name, browser
 
 
 @app.post("/api/v1/auth/auto-login")
@@ -444,21 +442,17 @@ async def auto_login(request: Request):
     ua = body.get("userAgent") or request.headers.get("user-agent", "")
     if not re.fullmatch(r"[A-Za-z0-9_\-]{8,64}", fp):
         raise HTTPException(400, "缺少有效的浏览器指纹")
-    os_name, device_desc = guess_device(ua)
+    os_name, browser = guess_device(ua)
     ip = request.client.host if request.client else ""
     with _db_lock, db() as conn:
         row = conn.execute("SELECT * FROM users WHERE fingerprint=?", (fp,)).fetchone()
         is_new = row is None
         if is_new:
-            base = f"{os_name}{device_desc}"
-            username, n = base, 1
-            while conn.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone():
-                n += 1
-                username = f"{base}-{n}"
+            display_name = f"{os_name} {browser}"
             cur = conn.execute(
                 "INSERT INTO users(fingerprint,username,display_name,created_ip,avatar_color,created_at) "
                 "VALUES(?,?,?,?,?,?)",
-                (fp, username, username, ip, random_color(), now_iso()))
+                (fp, fp, display_name, ip, random_color(), now_iso()))
             uid = cur.lastrowid
             row = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
             # 新成员自动加入所有频道
