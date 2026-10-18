@@ -4,7 +4,7 @@ EdgeChat-LAN —— 局域网部署版聊天系统
 去除全部 Telegram 联动 / Cloudflare Workers / D1/KV/R2 依赖，改为单机常驻进程 + SQLite。
 
 特性：
-- 邀请制注册 + 管理员账号体系（RBAC：admin / member）
+- 开放自助注册（局域网内直接注册，无需邀请码）+ 管理员账号体系（RBAC：admin / member）
 - 频道群聊 + 一对一私信（会话列表、未读数、@提及）
 - WebSocket 实时推送（protocolVersion:1，ready/message/message_deleted/room_message/presence/typing）
 - 一次性 realtime ticket（60 秒有效，对齐上游 WS 鉴权设计，token 不进 URL）
@@ -25,6 +25,7 @@ import os
 import re
 import secrets
 import sqlite3
+import sys
 import threading
 import time
 import uuid
@@ -161,14 +162,6 @@ CREATE TABLE IF NOT EXISTS sessions(
   created_at TEXT NOT NULL,
   expires_at TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS invites(
-  code TEXT PRIMARY KEY,
-  created_by INTEGER REFERENCES users(id),
-  used_by INTEGER REFERENCES users(id),
-  note TEXT DEFAULT '',
-  created_at TEXT NOT NULL,
-  used_at TEXT
-);
 CREATE TABLE IF NOT EXISTS rooms(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   kind TEXT NOT NULL,                           -- channel | private
@@ -222,20 +215,28 @@ CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
 """
 
 
+_first_run_info = None  # 首次启动时记录管理员初始密码，供启动横幅输出
+
+
 def init_db():
+    global _first_run_info
     with _db_lock, db() as conn:
         conn.executescript(SCHEMA)
+        # 清理旧版本遗留的 invites 表（已取消邀请制）
+        conn.execute("DROP TABLE IF EXISTS invites")
         if not conn.execute("SELECT 1 FROM users LIMIT 1").fetchone():
-            pwd = os.environ.get("EDGECHAT_ADMIN_PASSWORD") or secrets.token_urlsafe(9)
+            env_pwd = os.environ.get("EDGECHAT_ADMIN_PASSWORD")
+            pwd = env_pwd or secrets.token_urlsafe(9)
             conn.execute(
                 "INSERT INTO users(username,display_name,password_hash,role,created_at) VALUES(?,?,?,?,?)",
                 ("admin", "管理员", hash_password(pwd), "admin", now_iso()),
             )
-            print("=" * 60)
-            print("首次启动：已创建管理员账号 admin")
-            if not os.environ.get("EDGECHAT_ADMIN_PASSWORD"):
-                print(f"随机初始密码: {pwd}")
-            print("=" * 60)
+            _first_run_info = {"password": pwd, "fromEnv": bool(env_pwd)}
+            # 同时落盘一份，防止终端日志滚走找不到密码
+            (DATA_DIR / "admin_initial_password.txt").write_text(
+                f"用户名: admin\n密码: {pwd}\n"
+                + ("(来自环境变量 EDGECHAT_ADMIN_PASSWORD)\n" if env_pwd else "(随机生成，请登录后尽快修改)\n"),
+                encoding="utf-8")
         # 默认欢迎频道 + 系统机器人消息
         if not conn.execute("SELECT 1 FROM rooms LIMIT 1").fetchone():
             cur = conn.execute(
@@ -482,9 +483,8 @@ async def login(request: Request):
 
 @app.post("/api/v1/auth/register")
 async def register(request: Request):
-    """邀请制注册：必须携带管理员生成的邀请码，不开放自助注册。"""
+    """开放注册：局域网内任何用户可直接注册，无需邀请码。"""
     body = await request.json()
-    code = (body.get("inviteCode") or "").strip()
     username = (body.get("username") or "").strip()
     password = body.get("password") or ""
     display = (body.get("displayName") or username).strip()
@@ -493,9 +493,6 @@ async def register(request: Request):
     if len(password) < 6:
         raise HTTPException(400, "密码至少 6 位")
     with _db_lock, db() as conn:
-        inv = conn.execute("SELECT * FROM invites WHERE code=?", (code,)).fetchone()
-        if not inv or inv["used_by"]:
-            raise HTTPException(400, "邀请码无效或已被使用")
         if conn.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone():
             raise HTTPException(400, "用户名已存在")
         cur = conn.execute(
@@ -503,7 +500,6 @@ async def register(request: Request):
             (username, display, hash_password(password), now_iso(), random_color()),
         )
         uid = cur.lastrowid
-        conn.execute("UPDATE invites SET used_by=?, used_at=? WHERE code=?", (uid, now_iso(), code))
         welcome = conn.execute("SELECT id FROM rooms WHERE kind='channel' AND name='综合'").fetchone()
         if welcome:
             conn.execute("INSERT OR IGNORE INTO room_members(room_id,user_id,joined_at) VALUES(?,?,?)",
@@ -777,25 +773,6 @@ async def admin_stats(request: Request):
         }
 
 
-@app.get("/api/v1/admin/invites")
-async def list_invites(request: Request):
-    require_admin(request)
-    with _db_lock, db() as conn:
-        rows = conn.execute("SELECT * FROM invites ORDER BY created_at DESC").fetchall()
-        return {"invites": [dict(r) for r in rows]}
-
-
-@app.post("/api/v1/admin/invites")
-async def make_invite(request: Request):
-    require_admin(request)
-    body = await request.json()
-    code = secrets.token_urlsafe(12)
-    with _db_lock, db() as conn:
-        conn.execute("INSERT INTO invites(code,created_by,note,created_at) VALUES(?,?,?,?)",
-                     (code, body.get("_by", 1), body.get("note", ""), now_iso()))
-    return {"code": code}
-
-
 @app.post("/api/v1/admin/users/{uid}/ban")
 async def ban_user(request: Request, uid: int):
     admin = require_admin(request)
@@ -910,9 +887,24 @@ async def index():
     return (BASE_DIR / "static" / "index.html").read_text(encoding="utf-8")
 
 
+def _startup_banner():
+    """启动横幅：在 uvicorn 日志系统初始化之前输出，确保首次启动的管理员密码一定可见。"""
+    sys.stdout.write("=" * 60 + "\n")
+    sys.stdout.write("EdgeChat-LAN 启动: http://%s:%s  (局域网内其他设备用本机 IP 访问)\n" % (HOST, PORT))
+    if _first_run_info:
+        pwd = _first_run_info["password"]
+        sys.stdout.write("首次启动：已创建管理员账号 admin\n")
+        if _first_run_info["fromEnv"]:
+            sys.stdout.write("初始密码来自环境变量 EDGECHAT_ADMIN_PASSWORD\n")
+        else:
+            sys.stdout.write(f"随机初始密码: {pwd}\n")
+    sys.stdout.write("=" * 60 + "\n")
+    sys.stdout.flush()
+
+
 init_db()
 
 if __name__ == "__main__":
     import uvicorn
-    print(f"EdgeChat-LAN 启动: http://{HOST}:{PORT}  (局域网内其他设备用本机 IP 访问)")
+    _startup_banner()
     uvicorn.run(app, host=HOST, port=PORT)

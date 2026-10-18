@@ -94,16 +94,15 @@ th,td{text-align:left;padding:8px;border-bottom:1px solid var(--line)}
 <div id="authView">
   <div class="authCard">
     <h1>🛰️ EdgeChat-LAN</h1>
-    <div class="sub">局域网部署版聊天系统 · 邀请制</div>
+    <div class="sub">局域网部署版聊天系统 · 开放注册</div>
     <div id="loginForm">
       <label>用户名</label><input id="liUser" placeholder="admin">
       <label>密码</label><input id="liPass" type="password" placeholder="••••••">
       <button class="btn" onclick="doLogin()">登 录</button>
       <div class="err" id="liErr"></div>
-      <div class="switch">收到邀请码？<a onclick="toggleAuth(false)">使用邀请码注册</a></div>
+      <div class="switch">还没有账号？<a onclick="toggleAuth(false)">注册新账号</a></div>
     </div>
     <div id="regForm" class="hidden">
-      <label>邀请码</label><input id="rgCode" placeholder="管理员生成的邀请码">
       <label>用户名</label><input id="rgUser">
       <label>昵称</label><input id="rgDisp">
       <label>密码（≥6位）</label><input id="rgPass" type="password">
@@ -163,12 +162,9 @@ th,td{text-align:left;padding:8px;border-bottom:1px solid var(--line)}
     <h2>⚙️ 管理后台</h2>
     <div class="statGrid" id="statGrid"></div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px">
-      <button class="btn sm" onclick="genInvite()">生成邀请码</button>
       <button class="btn sm ghost" onclick="rotateKey()">轮换加密密钥</button>
       <button class="btn sm ghost" onclick="showCreateUser()">创建账号</button>
     </div>
-    <h3 style="font-size:13px;margin:14px 0 6px">邀请码</h3>
-    <div id="inviteTable"></div>
     <h3 style="font-size:13px;margin:14px 0 6px">用户管理（临时封禁到期自动解除）</h3>
     <div id="banTable"></div>
     <p style="font-size:12px;color:var(--muted);margin-top:14px">隐私说明：后台不提供任何消息正文的搜索或查看入口，仅展示聚合统计。</p>
@@ -209,7 +205,7 @@ async function doLogin(){
 }
 async function doRegister(){
   try{
-    const d = await api('/auth/register',{method:'POST',body:{inviteCode:$('rgCode').value,username:$('rgUser').value,password:$('rgPass').value,displayName:$('rgDisp').value}});
+    const d = await api('/auth/register',{method:'POST',body:{username:$('rgUser').value,password:$('rgPass').value,displayName:$('rgDisp').value}});
     TOKEN=d.token; localStorage.setItem('ec_token',TOKEN); enterApp();
   }catch(e){$('rgErr').textContent=e.message;}
 }
@@ -386,9 +382,6 @@ async function openAdmin(){
    <div class="stat"><b>${s.messages}</b><span>消息总数</span></div>
    <div class="stat"><b>${fmtSize(fs.s||0)}</b><span>文件占用</span></div>
    <div class="stat"><b>v${s.keyVersion}</b><span>加密密钥版本</span></div>`;
-  const inv=await api('/admin/invites');
-  $('inviteTable').innerHTML='<table><tr><th>邀请码</th><th>备注</th><th>状态</th><th>创建时间</th></tr>'+
-    inv.invites.map(i=>`<tr><td><code>${esc(i.code)}</code></td><td>${esc(i.note)}</td><td>${i.used_by?'✅ 已用':'<span class="tag">未使用</span>'}</td><td>${(i.created_at||'').slice(0,16).replace('T',' ')}</td></tr>`).join('')+'</table>';
   const us=await api('/users');
   $('banTable').innerHTML='<table><tr><th>用户</th><th>角色</th><th>状态</th><th>操作</th></tr>'+
     us.users.map(u=>`<tr><td>${esc(u.displayName)} @${esc(u.username)}</td><td>${u.role==='admin'?'管理员':'成员'}</td><td>${u.online?'🟢 在线':'⚪ 离线'}</td>
@@ -396,7 +389,6 @@ async function openAdmin(){
         <button class="btn sm ghost" onclick="banUser(${u.id},0)">永久封禁</button>
         <button class="btn sm ghost" onclick="unbanUser(${u.id})">解封</button></td></tr>`).join('')+'</table>';
 }
-async function genInvite(){ const d=await api('/admin/invites',{method:'POST',body:{note:'LAN invite'}}); prompt('新邀请码（发给要加入的人）：',d.code); openAdmin(); }
 async function rotateKey(){ await api('/admin/keys/rotate',{method:'POST'}); toast('已轮换密钥，新消息将使用新版本加密'); openAdmin(); }
 async function showCreateUser(){
   const username=prompt('新用户名：'); if(!username)return;
