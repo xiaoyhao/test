@@ -1,0 +1,11 @@
+services:
+  edgechat-lan:
+    build: .
+    ports:
+      - "8790:8790"          # 局域网内其他设备通过 <宿主机IP>:8790 访问
+    environment:
+      EDGECHAT_ADMIN_PASSWORD: "${EDGECHAT_ADMIN_PASSWORD:-}"   # 留空则随机生成并在日志打印
+      EDGECHAT_MAX_UPLOAD_MB: "50"
+    volumes:
+      - ./data:/app/data     # SQLite + 上传文件 + 密钥环持久化
+    restart: unless-stopped
