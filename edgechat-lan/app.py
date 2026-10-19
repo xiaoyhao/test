@@ -4,7 +4,8 @@ EdgeChat-LAN —— 局域网部署版聊天系统（极简版）
 去除全部 Telegram 联动 / Cloudflare Workers / D1/KV/R2 依赖，改为单机常驻进程 + SQLite。
 
 特性：
-- 免登录：打开页面即自动注册，浏览器指纹标识用户，用户名形如 "Windows Chrome笔记本"
+- 免登录：打开页面即自动注册，画布指纹生成用户名；同一账号可在多个浏览器/设备同时登录
+- 昵称（display_name）默认与 username 相同，用户可自行修改（点击左下角个人信息）
 - 无管理员体系：所有用户权限相同，任何人都可创建频道和发起私聊
 - 频道群聊 + 一对一私信（会话列表、未读数、@提及）
 - WebSocket 实时推送（protocolVersion:1，ready/message/message_deleted/room_message/presence/typing）
@@ -17,8 +18,6 @@ EdgeChat-LAN —— 局域网部署版聊天系统（极简版）
 from __future__ import annotations
 
 import base64
-import hashlib
-import hmac
 import json
 import os
 import re
@@ -50,16 +49,12 @@ SESSION_TTL_DAYS = 365  # 指纹登录，token 长期有效
 
 app = FastAPI(title="EdgeChat-LAN", version="2.0.0")
 
-# ------------------------------------------------------------------ 加密（AES-256-GCM via cryptography，缺失时回落 HMAC-CTR 方案）
-try:
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    _HAS_AESGCM = True
-except Exception:  # pragma: no cover
-    _HAS_AESGCM = False
+# ------------------------------------------------------------------ 加密（AES-256-GCM via cryptography，为必需依赖）
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 
 class MessageCipher:
-    """密钥版本化加密：密文格式 enc:v{N}:{base64(nonce|ct|tag)}"""
+    """密钥版本化加密：密文格式 enc:v{N}:{base64(nonce|ct|tag)}（仅支持当前密钥环内的版本）"""
 
     def __init__(self, keyring_path: Path):
         self.keyring_path = keyring_path
@@ -85,41 +80,21 @@ class MessageCipher:
         raw = text.encode("utf-8")
         key = self.keys[self.current_version]
         nonce = secrets.token_bytes(12)
-        if _HAS_AESGCM:
-            ct = AESGCM(key).encrypt(nonce, raw, None)
-            return f"enc:v{self.current_version}:{base64.b64encode(nonce + ct).decode()}"
-        stream = b""
-        counter = 0
-        while len(stream) < len(raw):
-            block = nonce + counter.to_bytes(4, "big")
-            stream += hmac.new(key, block, hashlib.sha256).digest()
-            counter += 1
-        ct = bytes(a ^ b for a, b in zip(raw, stream))
-        tag = hmac.new(key, nonce + ct, hashlib.sha256).digest()[:16]
-        return f"enc:v0-basic:{base64.b64encode(nonce + tag + ct).decode()}"
+        ct = AESGCM(key).encrypt(nonce, raw, None)
+        return f"enc:v{self.current_version}:{base64.b64encode(nonce + ct).decode()}"
 
     def decrypt(self, blob: str) -> str:
         if not blob.startswith("enc:"):
             return blob
         _, ver, b64 = blob.split(":", 2)
         data = base64.b64decode(b64)
-        if ver == "v0-basic":
-            key = self.keys.get(1) or next(iter(self.keys.values()))
-            nonce, tag, ct = data[:12], data[12:28], data[28:]
-            if not hmac.compare_digest(hmac.new(key, nonce + ct, hashlib.sha256).digest()[:16], tag):
-                raise ValueError("decrypt integrity failure")
-            stream = b""
-            counter = 0
-            while len(stream) < len(ct):
-                stream += hmac.new(key, nonce + counter.to_bytes(4, "big"), hashlib.sha256).digest()
-                counter += 1
-            return bytes(a ^ b for a, b in zip(ct, stream)).decode("utf-8")
-        version = int(ver[1:])
+        try:
+            version = int(ver[1:])
+        except ValueError:  # 非标准版本标记（如旧版 enc:v0-basic），不再支持
+            return "[无法解密的旧版本消息]"
         key = self.keys.get(version)
         if key is None:
             return "[无法解密的旧版本消息]"
-        if not _HAS_AESGCM:
-            return "[无法解密：当前运行环境缺少 cryptography 库]"
         try:
             return AESGCM(key).decrypt(data[:12], data[12:], None).decode("utf-8")
         except Exception:
@@ -143,9 +118,9 @@ def db() -> sqlite3.Connection:
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  fingerprint TEXT UNIQUE NOT NULL,             -- 浏览器指纹哈希
-  username TEXT UNIQUE NOT NULL,                -- 自动生成：系统+设备
-  display_name TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,                    -- 浏览器指纹哈希（同一账号可在多个浏览器/设备同时登录，故不再唯一）
+  username TEXT UNIQUE NOT NULL,                -- 自动生成：画布指纹哈希
+  display_name TEXT NOT NULL DEFAULT '',        -- 昵称，默认跟随 username，可自行修改
   created_ip TEXT DEFAULT '',
   avatar_color TEXT DEFAULT '',
   created_at TEXT NOT NULL
@@ -210,15 +185,18 @@ CREATE TABLE IF NOT EXISTS tickets(
 
 def init_db():
     with _db_lock, db() as conn:
-        # 清理旧版本遗留表（邀请制 / 管理员体系已移除）
-        conn.execute("DROP TABLE IF EXISTS invites")
+        # 不支持旧版数据库：检测到遗留结构（邀请制/管理员体系或 fingerprint UNIQUE 约束）时直接清库重建
         old_cols = [r["name"] for r in conn.execute("PRAGMA table_info(users)").fetchall()]
-        if old_cols and ("password_hash" in old_cols or "role" in old_cols or "fingerprint" not in old_cols):
-            # 旧库结构不兼容：重建 users 相关数据（局域网演示场景，直接清库重来）
-            conn.executescript("DROP TABLE IF EXISTS users; DROP TABLE IF EXISTS sessions;"
-                               "DROP TABLE IF EXISTS room_members; DROP TABLE IF EXISTS messages;"
-                               "DROP TABLE IF EXISTS files; DROP TABLE IF EXISTS rooms;")
-            old_cols = []
+        if old_cols:
+            idx_info = conn.execute("PRAGMA index_list(users)").fetchall()
+            has_unique_fp = any(
+                i["unique"] and [c["name"] for c in conn.execute(f"PRAGMA index_info({i['name']})").fetchall()] == ["fingerprint"]
+                for i in idx_info)
+            if "password_hash" in old_cols or "role" in old_cols or "fingerprint" not in old_cols or has_unique_fp:
+                conn.executescript("DROP TABLE IF EXISTS users; DROP TABLE IF EXISTS sessions;"
+                                   "DROP TABLE IF EXISTS room_members; DROP TABLE IF EXISTS messages;"
+                                   "DROP TABLE IF EXISTS files; DROP TABLE IF EXISTS rooms;"
+                                   "DROP TABLE IF EXISTS invites;")
         conn.executescript(SCHEMA)
         if not conn.execute("SELECT 1 FROM rooms LIMIT 1").fetchone():
             cur = conn.execute(
@@ -305,11 +283,12 @@ hub = Hub()
 
 # ------------------------------------------------------------------ 通用序列化
 def public_user(row: sqlite3.Row) -> dict:
+    display = row["display_name"] or row["username"]
     return {
         "kind": "local",
         "id": row["id"],
         "username": row["username"],
-        "displayName": row["display_name"],
+        "displayName": display,
         "avatarUrl": "",
         "color": row["avatar_color"],
         "source": "edgechat-lan",
@@ -436,29 +415,35 @@ def guess_device(ua: str) -> tuple[str, str]:
 
 @app.post("/api/v1/auth/auto-login")
 async def auto_login(request: Request):
-    """免密自动注册/登录：以浏览器指纹定位用户，首次访问自动建号。"""
+    """免密自动注册/登录：以画布指纹(username)定位账号，同一账号可在多个浏览器/设备同时登录。"""
     body = await request.json()
     fp = (body.get("fingerprint") or "").strip()
+    canvas_fp = (body.get("canvasFp") or "").strip()
     ua = body.get("userAgent") or request.headers.get("user-agent", "")
     if not re.fullmatch(r"[A-Za-z0-9_\-]{8,64}", fp):
         raise HTTPException(400, "缺少有效的浏览器指纹")
-    os_name, browser = guess_device(ua)
     ip = request.client.host if request.client else ""
+    # username 使用画布指纹哈希（canvas.toDataURL() -> hash），缺失时回落设备指纹哈希
+    username = canvas_fp if re.fullmatch(r"[A-Za-z0-9_\-]{8,64}", canvas_fp) else fp
     with _db_lock, db() as conn:
-        row = conn.execute("SELECT * FROM users WHERE fingerprint=?", (fp,)).fetchone()
+        # 先按 username 找账号：换浏览器/设备（fp 变化）也视为同一用户，支持同时登录
+        row = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
         is_new = row is None
         if is_new:
-            display_name = f"{os_name} {browser}"
             cur = conn.execute(
                 "INSERT INTO users(fingerprint,username,display_name,created_ip,avatar_color,created_at) "
                 "VALUES(?,?,?,?,?,?)",
-                (fp, fp, display_name, ip, random_color(), now_iso()))
+                (fp, username, "", ip, random_color(), now_iso()))
             uid = cur.lastrowid
             row = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
             # 新成员自动加入所有频道
             for w in conn.execute("SELECT id FROM rooms WHERE kind='channel'").fetchall():
                 conn.execute("INSERT OR IGNORE INTO room_members(room_id,user_id,joined_at) VALUES(?,?,?)",
                              (w["id"], uid, now_iso()))
+        elif row["fingerprint"] != fp:
+            # 老版本遗留数据：同一 username 但旧 fingerprint 记录不同，更新为当前设备的指纹
+            conn.execute("UPDATE users SET fingerprint=? WHERE id=?", (fp, row["id"]))
+            row = conn.execute("SELECT * FROM users WHERE id=?", (row["id"],)).fetchone()
         token = secrets.token_urlsafe(32)
         conn.execute("INSERT INTO sessions(token,user_id,created_at,expires_at) VALUES(?,?,?,?)",
                      (token, row["id"], now_iso(),
@@ -470,6 +455,26 @@ async def auto_login(request: Request):
 async def me(request: Request):
     u = require_user(request)
     return {"user": public_user(u)}
+
+
+@app.patch("/api/v1/me")
+async def update_me(request: Request):
+    """修改自己的昵称（display_name）。传空字符串则恢复默认（显示 username）。"""
+    u = require_user(request)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "请求体必须为 JSON")
+    name = str(body.get("displayName") or "").strip()
+    if len(name) > 32:
+        raise HTTPException(400, "昵称最长 32 个字符")
+    with _db_lock, db() as conn:
+        conn.execute("UPDATE users SET display_name=? WHERE id=?", (name, u["id"]))
+        row = conn.execute("SELECT * FROM users WHERE id=?", (u["id"],)).fetchone()
+    # 通知所有在线会话：该用户昵称已变更
+    payload = public_user(row)
+    await hub.broadcast({"type": "userUpdated", "user": payload})
+    return {"user": payload}
 
 
 @app.post("/api/v1/auth/logout")
